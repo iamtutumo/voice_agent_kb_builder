@@ -1,0 +1,8 @@
+/venv
+/test_docs
+.env
+data/document_content_20250503_201750.json
+data/elevenlabs_knowledge_base_20250503_202322.txt
+data/final_voice_agent_20250503_202322.json
+data/processed_content_20250503_202201.json
+data/scraped_content_20250503_201705.json
