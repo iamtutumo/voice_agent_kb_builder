@@ -49,6 +49,86 @@ def extract_plain_text(combined_content: Dict[str, Any]) -> str:
     
     return "\n".join(text_parts)
 
+def render_tree_node(node, tree_data, prefix="", is_last=True, parent_prefix=""):
+    """Render a single tree node with visual tree structure"""
+    # Generate tree symbols
+    tree_prefix = parent_prefix + ("└── " if is_last else "├── ")
+    next_prefix = parent_prefix + ("    " if is_last else "│   ")
+    
+    # Create importance display
+    importance = node.get('importance', 1)
+    stars = "★" * importance + "☆" * (3 - importance)
+    
+    # Create checkbox key
+    checkbox_key = f"select_{node['url']}"
+    if checkbox_key not in st.session_state:
+        # Default selection based on importance
+        st.session_state[checkbox_key] = importance >= 2
+    
+    # Display the node
+    with st.container():
+        cols = st.columns([0.08, 0.82, 0.1])
+        
+        with cols[0]:
+            st.checkbox("", key=checkbox_key, label_visibility="collapsed")
+        
+        with cols[1]:
+            # Create display text
+            page_icon = "📄"
+            title = node.get('title') or node['url'].split('/')[-1] or 'Home'
+            page_type = node.get('type', 'page').title()
+            
+            display_text = f"`{tree_prefix}`{page_icon} **{title}** {stars} `({page_type})`"
+            st.markdown(display_text, unsafe_allow_html=True)
+        
+        with cols[2]:
+            # Show depth for debugging (optional)
+            if st.session_state.get('show_debug', False):
+                st.caption(f"D{node.get('depth', 0)}")
+    
+    # Render children
+    children = node.get('children', [])
+    for i, child in enumerate(children):
+        is_last_child = i == len(children) - 1
+        render_tree_node(child, tree_data, "", is_last_child, next_prefix)
+
+def collect_selected_urls(tree_data):
+    """Collect all selected URLs from the tree"""
+    selected_urls = []
+    
+    def collect_from_nodes(nodes):
+        for node in nodes:
+            checkbox_key = f"select_{node['url']}"
+            if st.session_state.get(checkbox_key, False):
+                selected_urls.append(node['url'])
+            
+            # Recursively collect from children
+            collect_from_nodes(node.get('children', []))
+    
+    collect_from_nodes(tree_data['root_nodes'])
+    return selected_urls
+
+def bulk_select_by_importance(tree_data, min_importance):
+    """Select all URLs with importance >= min_importance"""
+    def select_nodes(nodes):
+        for node in nodes:
+            if node.get('importance', 1) >= min_importance:
+                st.session_state[f"select_{node['url']}"] = True
+            else:
+                st.session_state[f"select_{node['url']}"] = False
+            select_nodes(node.get('children', []))
+    
+    select_nodes(tree_data['root_nodes'])
+
+def bulk_select_all(tree_data, select_state):
+    """Select or deselect all URLs"""
+    def set_nodes(nodes):
+        for node in nodes:
+            st.session_state[f"select_{node['url']}"] = select_state
+            set_nodes(node.get('children', []))
+    
+    set_nodes(tree_data['root_nodes'])
+
 # Load environment variables
 load_dotenv()
 
@@ -62,6 +142,8 @@ st.set_page_config(page_title="Voice Agent Builder", layout="wide")
 # Initialize session state
 if 'discovered_urls' not in st.session_state:
    st.session_state.discovered_urls = None
+if 'tree_data' not in st.session_state:
+   st.session_state.tree_data = None
 if 'site_content' not in st.session_state:
    st.session_state.site_content = None
 if 'document_content' not in st.session_state:
@@ -135,6 +217,12 @@ if st.button("Discover Pages"):
             st.session_state.scraper.discover_urls(url, status_callback=update_status)
         )
         
+        # Build tree structure
+        if st.session_state.discovered_urls:
+            st.session_state.tree_data = st.session_state.scraper.build_tree_structure(
+                st.session_state.discovered_urls
+            )
+        
         # Final stats after completion
         total_found = len(st.session_state.discovered_urls)
         
@@ -143,55 +231,74 @@ if st.button("Discover Pages"):
         with col1:
             st.metric("Total Pages Found", total_found)
         with col2:
-            page_types = set(url_info['type'] for url_info in st.session_state.discovered_urls)
-            st.metric("Different Page Types", len(page_types))
+            if st.session_state.tree_data:
+                importance_counts = {}
+                for node in st.session_state.tree_data['all_nodes'].values():
+                    imp = node.get('importance', 1)
+                    importance_counts[imp] = importance_counts.get(imp, 0) + 1
+                high_importance = importance_counts.get(3, 0)
+                st.metric("High Importance Pages", high_importance)
         with col3:
             st.metric("Target Domain", st.session_state.scraper.base_domain)
         
         st.success(f"Scan complete! Found {total_found} pages")
 
-# Display discovered URLs with checkboxes
-if st.session_state.discovered_urls:
+# Display discovered URLs in tree structure
+if st.session_state.tree_data:
     st.write("### Select Pages to Scrape")
     
-    # Add select/deselect all buttons in columns
-    col1, col2 = st.columns(2)
-    if col1.button("Select All"):
-        for url in st.session_state.discovered_urls:
-            st.session_state[f"select_{url['url']}"] = True
-    if col2.button("Deselect All"):
-        for url in st.session_state.discovered_urls:
-            st.session_state[f"select_{url['url']}"] = False
-
-    # Group URLs by type
-    urls_by_type = {}
-    for url_info in st.session_state.discovered_urls:
-        url_type = url_info['type']
-        if url_type not in urls_by_type:
-            urls_by_type[url_type] = []
-        urls_by_type[url_type].append(url_info)
-
-    # Display URLs grouped by type
-    for url_type, urls in urls_by_type.items():
-        st.write(f"#### {url_type.title()} Pages")
-        for url_info in urls:
-            key = f"select_{url_info['url']}"
-            # Fix for the Streamlit warning by only setting default value if needed
-            if key not in st.session_state:
-                st.session_state[key] = True
-            # Use the key without specifying a default value
-            st.checkbox(
-                f"{url_info['title'] or url_info['url']}",
-                key=key
-            )
-
+    # Help section
+    with st.expander("📖 How to Use", expanded=False):
+        st.markdown("""
+        - **★★★** = High importance (recommended)
+        - **★★☆** = Medium importance  
+        - **★☆☆** = Lower importance
+        - Use bulk selection buttons for quick selection
+        - Tree structure shows site organization
+        """)
+    
+    # Bulk selection controls
+    st.write("#### Quick Selection")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        if st.button("Select High ★★★"):
+            bulk_select_by_importance(st.session_state.tree_data, 3)
+            st.rerun()
+    
+    with col2:
+        if st.button("Select Med+ ★★☆+"):
+            bulk_select_by_importance(st.session_state.tree_data, 2)
+            st.rerun()
+    
+    with col3:
+        if st.button("Select All"):
+            bulk_select_all(st.session_state.tree_data, True)
+            st.rerun()
+    
+    with col4:
+        if st.button("Deselect All"):
+            bulk_select_all(st.session_state.tree_data, False)
+            st.rerun()
+    
+    with col5:
+        debug_mode = st.checkbox("Debug", key="show_debug")
+    
+    # Display tree structure
+    st.write("#### Site Structure")
+    
+    # Render the tree
+    root_nodes = st.session_state.tree_data['root_nodes']
+    for i, node in enumerate(root_nodes):
+        is_last = i == len(root_nodes) - 1
+        render_tree_node(node, st.session_state.tree_data, "", is_last, "")
+    
+    # Show selection summary
+    selected_urls = collect_selected_urls(st.session_state.tree_data)
+    st.write(f"**Selected: {len(selected_urls)} pages**")
+    
     # Scrape selected URLs
     if st.button("Scrape Selected Pages"):
-        selected_urls = [
-            url_info['url'] for url_info in st.session_state.discovered_urls
-            if st.session_state[f"select_{url_info['url']}"]
-        ]
-        
         if not selected_urls:
             st.warning("Please select at least one page to scrape")
         else:
