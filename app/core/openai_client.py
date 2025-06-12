@@ -8,13 +8,11 @@ from dotenv import load_dotenv
 
 # Import OpenAI with proper error handling
 try:
-    from openai import OpenAI
-    from openai.types.chat import ChatCompletion
-    # Import specific errors for better error handling
-    from openai import APIError, RateLimitError, APITimeoutError
+    import openai
+    from openai.error import OpenAIError, RateLimitError, Timeout as APITimeoutError
 except ImportError as e:
     logging.error(f"Error importing OpenAI: {e}")
-    raise ImportError("Please install the latest openai package: pip install --upgrade openai")
+    raise ImportError("Please install openai==0.28.1: pip install openai==0.28.1")
 
 # Load environment variables
 load_dotenv()
@@ -23,7 +21,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 class AIClient:
-    """Flexible OpenAI client with configurable models for version 1.77.0+"""
+    """Flexible OpenAI client with configurable models for openai<1.0.0"""
     
     def __init__(self):
         """Initialize the OpenAI client with API key from environment"""
@@ -31,19 +29,17 @@ class AIClient:
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY environment variable is not set")
-            
-        # Get model configurations from environment or use defaults
-        self.initial_model = os.getenv("OPENAI_INITIAL_MODEL", "gpt-4o-mini")
-        self.final_model = os.getenv("OPENAI_FINAL_MODEL", "gpt-4-turbo")
+        openai.api_key = self.api_key
         
-        # Initialize OpenAI client with minimal parameters
-        # In newer versions, proxies and other http parameters are handled differently
-        try:
-            self.client = OpenAI(api_key=self.api_key)
-            logger.info(f"Successfully initialized OpenAI client")
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {e}")
-            raise
+        # Get proxy from environment if set
+        self.proxy = os.getenv("OPENAI_PROXY")
+        if self.proxy:
+            openai.proxy = self.proxy
+            logger.info(f"Using OpenAI proxy: {self.proxy}")
+        
+        # Get model configurations from environment or use defaults
+        self.initial_model = os.getenv("OPENAI_INITIAL_MODEL", "gpt-3.5-turbo")
+        self.final_model = os.getenv("OPENAI_FINAL_MODEL", "gpt-3.5-turbo")
         
         logger.info(f"AI Client initialized with: Initial model: {self.initial_model}, Final model: {self.final_model}")
         
@@ -70,68 +66,50 @@ class AIClient:
         Returns:
             Parsed JSON response or error information
         """
-        # Use specified model or default to initial model
         selected_model = model or self.initial_model
-        
-        # Track retry attempts
         for attempt in range(self.max_retries):
             try:
-                # Format user prompt with content
                 formatted_user_prompt = user_prompt.format(content=content)
-                
-                # Create completion with json response format
                 logger.info(f"Sending request to {selected_model} (attempt {attempt+1}/{self.max_retries})")
-                
-                # Updated API call format for newer OpenAI versions
-                response = self.client.chat.completions.create(
+                response = openai.ChatCompletion.create(
                     model=selected_model,
                     temperature=temperature,
-                    response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": formatted_user_prompt}
-                    ]
+                    ],
+                    request_timeout=60,
+                    **({"proxies": {"http": self.proxy, "https": self.proxy}} if self.proxy else {})
                 )
-                
-                # Extract and parse JSON response
-                result_json = response.choices[0].message.content
-                
+                result_json = response["choices"][0]["message"]["content"]
                 try:
                     parsed_result = json.loads(result_json)
                     logger.info(f"Successfully processed content with {selected_model}")
                     return parsed_result
-                    
                 except json.JSONDecodeError as e:
                     logger.error(f"Error parsing JSON response: {e}")
                     logger.error(f"Received content: {result_json[:500]}...")
-                    
                     if attempt == self.max_retries - 1:
                         return {
                             "error": "Failed to parse JSON response",
-                            "raw_response": result_json[:1000]  # Include truncated response for debugging
+                            "raw_response": result_json[:1000]
                         }
-                    
             except RateLimitError as e:
                 logger.warning(f"Rate limit exceeded: {e}. Waiting before retry.")
-                # Exponential backoff
                 time.sleep(self.retry_delay * (2 ** attempt))
-                
             except APITimeoutError as e:
                 logger.warning(f"Request timed out: {e}. Waiting before retry.")
                 time.sleep(self.retry_delay * (2 ** attempt))
-                
-            except APIError as e:
+            except OpenAIError as e:
                 logger.error(f"API error: {e}")
                 if attempt == self.max_retries - 1:
                     return {"error": f"API error after {self.max_retries} attempts: {str(e)}"}
                 time.sleep(self.retry_delay)
-                
             except Exception as e:
                 logger.error(f"Unexpected error: {e}")
                 if attempt == self.max_retries - 1:
                     return {"error": f"Unexpected error: {str(e)}"}
                 time.sleep(self.retry_delay)
-        
         return {"error": f"Failed after {self.max_retries} attempts"}
     
     def process_full_content(self, 
@@ -153,44 +131,34 @@ class AIClient:
         Returns:
             Processed final document
         """
-        # Serialize content to JSON string for the prompt
         content_json = json.dumps(combined_content, ensure_ascii=False)
-        
-        # Add voice/text indicator to the prompt
         formatted_user_prompt = user_prompt.format(
             content=content_json,
             output_type="voice" if is_voice else "text"
         )
-        
         try:
             logger.info(f"Processing full content with {self.final_model}")
-            
-            # Using updated API call format for newer OpenAI versions
-            response = self.client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model=self.final_model,
                 temperature=temperature,
-                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": formatted_user_prompt}
-                ]
+                ],
+                request_timeout=120,
+                **({"proxies": {"http": self.proxy, "https": self.proxy}} if self.proxy else {})
             )
-            
-            # Extract and parse JSON response
-            result_json = response.choices[0].message.content
-            
+            result_json = response["choices"][0]["message"]["content"]
             try:
                 parsed_result = json.loads(result_json)
                 logger.info(f"Successfully processed full content")
                 return parsed_result
-                
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing JSON response: {e}")
                 return {
                     "error": "Failed to parse final JSON response",
-                    "raw_response": result_json[:1000]  # Include truncated response for debugging
+                    "raw_response": result_json[:1000]
                 }
-                
         except Exception as e:
             logger.error(f"Error processing full content: {e}")
             return {"error": f"Error processing full content: {str(e)}"}
